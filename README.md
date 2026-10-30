@@ -55,7 +55,7 @@ LSPosed 模块：给 ColorOS / realme UI 的自由小窗加上一个带**实时�
 
 ```bash
 ./gradlew assembleRelease
-# 产物：app/build/outputs/apk/release/freewindow-release.apk
+# 产物：app/build/outputs/apk/release/freewindow-<版本号>.apk
 ```
 
 实现细节、日志排查与已知问题见 [docs/LIVE-DOCK.md](docs/LIVE-DOCK.md)；更新记录见 [CHANGELOG.md](CHANGELOG.md)。
