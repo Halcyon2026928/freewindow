@@ -7,6 +7,7 @@ import android.view.View;
 import android.widget.CompoundButton;
 import android.widget.ImageView;
 import android.widget.Switch;
+import android.widget.TextView;
 
 /**
  * freewindow 设置界面。
@@ -18,6 +19,8 @@ public class SettingsActivity extends Activity {
     public static final String KEY_HIDE_BOTTOM_BAR = "hide_bottom_bar";
     public static final String KEY_HIDE_THREE_DOT = "hide_three_dot_menu";
     public static final String KEY_ENABLE_DOCK = "enable_float_dock";
+    public static final String KEY_ENABLE_LIVE = "enable_live_preview";
+    public static final String KEY_ENABLE_HANGUP = "enable_background_run";
 
     private static final String UI_PREFS = "ui_prefs";
     private static final String KEY_LIGHT_THEME = "light_theme";
@@ -25,6 +28,8 @@ public class SettingsActivity extends Activity {
     private Switch bottomBarSwitch;
     private Switch threeDotSwitch;
     private Switch dockSwitch;
+    private Switch liveSwitch;
+    private Switch hangupSwitch;
     private boolean syncing = false;
 
     @Override
@@ -49,6 +54,16 @@ public class SettingsActivity extends Activity {
         bottomBarSwitch = findViewById(R.id.switch_bottom_bar);
         threeDotSwitch = findViewById(R.id.switch_three_dot);
         dockSwitch = findViewById(R.id.switch_dock);
+        liveSwitch = findViewById(R.id.switch_live);
+        hangupSwitch = findViewById(R.id.switch_hangup);
+
+        findViewById(R.id.btnDynamicApps).setOnClickListener(new View.OnClickListener() {
+            @Override
+            public void onClick(View v) {
+                startActivity(new android.content.Intent(SettingsActivity.this,
+                        DynamicAppsActivity.class));
+            }
+        });
 
         syncFromPrefs();
 
@@ -73,6 +88,20 @@ public class SettingsActivity extends Activity {
                 writePref(KEY_ENABLE_DOCK, isChecked);
             }
         });
+        liveSwitch.setOnCheckedChangeListener(new CompoundButton.OnCheckedChangeListener() {
+            @Override
+            public void onCheckedChanged(CompoundButton buttonView, boolean isChecked) {
+                if (syncing) return;
+                writePref(KEY_ENABLE_LIVE, isChecked);
+            }
+        });
+        hangupSwitch.setOnCheckedChangeListener(new CompoundButton.OnCheckedChangeListener() {
+            @Override
+            public void onCheckedChanged(CompoundButton buttonView, boolean isChecked) {
+                if (syncing) return;
+                writePref(KEY_ENABLE_HANGUP, isChecked);
+            }
+        });
     }
 
     private void syncFromPrefs() {
@@ -80,6 +109,8 @@ public class SettingsActivity extends Activity {
         bottomBarSwitch.setChecked(readPref(KEY_HIDE_BOTTOM_BAR, true));
         threeDotSwitch.setChecked(readPref(KEY_HIDE_THREE_DOT, true));
         dockSwitch.setChecked(readPref(KEY_ENABLE_DOCK, true));
+        liveSwitch.setChecked(readPref(KEY_ENABLE_LIVE, true));
+        hangupSwitch.setChecked(readPref(KEY_ENABLE_HANGUP, true));
         syncing = false;
     }
 
@@ -93,5 +124,27 @@ public class SettingsActivity extends Activity {
 
     private boolean isLightTheme() {
         return getSharedPreferences(UI_PREFS, Context.MODE_PRIVATE).getBoolean(KEY_LIGHT_THEME, true);
+    }
+
+    @Override
+    protected void onResume() {
+        super.onResume();
+        updateDynamicSummary();
+    }
+
+    private void updateDynamicSummary() {
+        String csv = ModulePrefs.get(this).getString(ModulePrefs.KEY_DYNAMIC_APPS, "");
+        int count = 0;
+        if (csv != null) {
+            for (String item : csv.split(",")) {
+                if (!item.isEmpty()) count++;
+            }
+        }
+        TextView summary = findViewById(R.id.tvDynamicSummary);
+        if (summary != null) {
+            summary.setText(count == 0
+                    ? "未选择：按内置名单自动判断"
+                    : "已选择 " + count + " 个应用");
+        }
     }
 }

@@ -46,6 +46,16 @@ public final class LivelyHook {
     private LivelyHook() {
     }
 
+    /** 给坞窗取一张静态截图：用抓到的任务快照缓存。静态卡片只需要这张图。 */
+    public static android.graphics.Bitmap snapshotOf(int taskId) {
+        try {
+            android.graphics.Bitmap cached = sSnapshots.get(taskId);
+            if (cached != null && !cached.isRecycled()) return cached;
+        } catch (Throwable ignored) {
+        }
+        return null;
+    }
+
     private static void log(String msg) {
         Log.e(TAG, msg);
         XposedBridge.log("[" + TAG + "] " + msg);

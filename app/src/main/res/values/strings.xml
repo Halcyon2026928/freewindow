@@ -1,9 +1,9 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
-    <string name="app_name">freewindow</string>
+    <string name="app_name">灵动坞OS</string>
 
-    <string name="settings_title">freewindow 设置</string>
-    <string name="settings_subtitle">自由小窗装饰项，可独立开关</string>
+    <string name="settings_title">灵动坞OS 设置</string>
+    <string name="settings_subtitle">自由小窗坞窗与实时画面，可独立开关</string>
 
     <string name="hide_bottom_bar_title">隐藏窗口白条</string>
     <string name="hide_bottom_bar_desc">隐藏自由小窗底部的白色手势横条</string>
@@ -12,7 +12,16 @@
     <string name="hide_three_dot_desc">移除顶部三点按钮（视觉、点击、触摸穿透）</string>
 
     <string name="enable_dock_title">启用坞窗</string>
-    <string name="enable_dock_desc">点击悬浮球弹出坞窗卡片；关闭后按系统默认恢复迷你浮窗</string>
+    <string name="enable_dock_desc">点击悬浮球弹出坞窗卡片；</string>
+
+    <string name="enable_live_title">实时画面</string>
+    <string name="enable_live_desc">坞窗卡片显示应用的真实运行画面</string>
+
+    <string name="enable_hangup_title">后台保活</string>
+    <string name="enable_hangup_desc">应用收进悬浮球后仍在后台运行，画面和音频都不中断</string>
+
+    <string name="dynamic_apps_title">动态应用</string>
+    <string name="dynamic_apps_hint">勾选的应用在坞窗里走实时画面，其余只显示截图</string>
 
     <string name="settings_hint">开关会记住你的选择，重启手机后保持上次状态。改开关后重新打开自由小窗即可生效</string>
 

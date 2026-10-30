@@ -1,7 +1,10 @@
 package io.github.halcyon2026928.freewindow;
 
+import android.content.BroadcastReceiver;
 import android.content.ContentResolver;
 import android.content.Context;
+import android.content.Intent;
+import android.content.IntentFilter;
 import android.content.pm.ApplicationInfo;
 import android.content.pm.PackageManager;
 import android.database.Cursor;
@@ -10,6 +13,8 @@ import android.graphics.Rect;
 import android.graphics.Region;
 import android.graphics.drawable.GradientDrawable;
 import android.os.Build;
+import android.os.Handler;
+import android.os.Looper;
 import android.util.TypedValue;
 import android.view.Gravity;
 import android.view.MotionEvent;
@@ -43,6 +48,8 @@ public class MainHook implements IXposedHookLoadPackage {
     private static final String KEY_HIDE_BOTTOM_BAR = "hide_bottom_bar";
     private static final String KEY_HIDE_THREE_DOT = "hide_three_dot_menu";
     private static final String KEY_ENABLE_DOCK = "enable_float_dock";
+    private static final String KEY_ENABLE_LIVE = "enable_live_preview";
+    private static final String KEY_ENABLE_HANGUP = "enable_background_run";
 
     /** 设为 true 时会把 FlexibleTaskCaptionView 的完整视图树打印到 Xposed 日志，便于在真机上确认三点按钮的确切 id。 */
     private static final boolean DUMP_CAPTION_TREE = false;
@@ -52,6 +59,8 @@ public class MainHook implements IXposedHookLoadPackage {
     private boolean hideBottomBar = true;
     private boolean hideThreeDot = true;
     private boolean enableDock = true;
+    private boolean enableLiveDock = true;
+    private boolean enableHangup = true;
     private boolean configLoaded = false;
 
     /** 系统框架 ClassLoader。 */
@@ -73,6 +82,8 @@ public class MainHook implements IXposedHookLoadPackage {
     private static final List<Object> sDockApps = new ArrayList<>();
     /** 坞窗是否正在显示。 */
     private static boolean sDockShowing = false;
+    /** 正在走官方恢复流程：让悬浮球点击的拦截暂时放行。 */
+    private static volatile boolean sRestoring = false;
 
     @Override
     public void handleLoadPackage(XC_LoadPackage.LoadPackageParam lpparam) {
@@ -113,6 +124,10 @@ public class MainHook implements IXposedHookLoadPackage {
                             hideThreeDot = value == 1;
                         } else if (KEY_ENABLE_DOCK.equals(key)) {
                             enableDock = value == 1;
+                        } else if (KEY_ENABLE_LIVE.equals(key)) {
+                            enableLiveDock = value == 1;
+                        } else if (KEY_ENABLE_HANGUP.equals(key)) {
+                            enableHangup = value == 1;
                         }
                     }
                     configLoaded = true;
@@ -138,11 +153,17 @@ public class MainHook implements IXposedHookLoadPackage {
             hideBottomBar = prefs.getBoolean(KEY_HIDE_BOTTOM_BAR, true);
             hideThreeDot = prefs.getBoolean(KEY_HIDE_THREE_DOT, true);
             enableDock = prefs.getBoolean(KEY_ENABLE_DOCK, true);
+            enableLiveDock = prefs.getBoolean(KEY_ENABLE_LIVE, true);
+            enableHangup = prefs.getBoolean(KEY_ENABLE_HANGUP, true);
+            updateUserDynamicPackages(prefs.getString(ModulePrefs.KEY_DYNAMIC_APPS, ""));
             configLoaded = true;
             XposedBridge.log(TAG + " config(xprefs readable=" + prefs.getFile().canRead()
                     + ") -> hideBottomBar=" + hideBottomBar
                     + " hideThreeDot=" + hideThreeDot
-                    + " enableDock=" + enableDock);
+                    + " enableDock=" + enableDock
+                    + " enableLiveDock=" + enableLiveDock
+                    + " enableHangup=" + enableHangup
+                    + " dynamicWhitelist=" + sUserDynamicPackages.size());
         } catch (Throwable t) {
             XposedBridge.log(TAG + " XSharedPreferences error: " + t.getMessage());
         }
@@ -210,12 +231,18 @@ public class MainHook implements IXposedHookLoadPackage {
             XposedBridge.log(TAG + " hook FlexibleTaskCaptionView failed: " + t.getMessage());
         }
 
-        // 第六层：游戏助手 HangUpUtil 后台挂机（最小化进悬浮球后音频继续）
-        // try {
-        //     MirageWindowHook.hook(lpparam.classLoader);
-        // } catch (Throwable t) {
-        //     XposedBridge.log(TAG + " MirageWindowHook failed: " + t.getMessage());
-        // }
+        // 第六层：后台保活——应用收进悬浮球后，用 ColorOS 的「幻影窗口/后台流」让它在系统虚拟显示器上继续运行。
+        // 这样球的状态完全不受影响，画面也还在，坞窗卡片才有东西可取。
+        try {
+            loadFromXSharedPrefs();
+            if (enableHangup) {
+                MirageWindowHook.hook(lpparam.classLoader);
+            } else {
+                XposedBridge.log(TAG + " hangup disabled, skip MirageWindowHook");
+            }
+        } catch (Throwable t) {
+            XposedBridge.log(TAG + " MirageWindowHook failed: " + t.getMessage());
+        }
     }
 
     /**
@@ -525,6 +552,8 @@ public class MainHook implements IXposedHookLoadPackage {
                         @Override
                         protected void beforeHookedMethod(MethodHookParam param) {
                             try {
+                                // 我们自己正在走官方恢复：放行，别再弹坞窗。
+                                if (sRestoring) return;
                                 Object floatHandleView = param.thisObject;
                                 try {
                                     Context ctx = (Context) XposedHelpers.callMethod(floatHandleView, "getContext");
@@ -545,7 +574,15 @@ public class MainHook implements IXposedHookLoadPackage {
                                 XposedBridge.log(TAG + " float handle clicked, reason=" + reason);
                                 param.setResult(false);
                                 sCurrentFloatHandleView = floatHandleView;
-                                showFloatDock(floatHandleView, floatHandleInfo, cl);
+                                // 记住悬浮球所在线程（android.ui）的 Handler，后面隐藏/恢复都靠它。
+                                if (floatHandleView instanceof View) {
+                                    sHandleHandler = ((View) floatHandleView).getHandler();
+                                }
+                                // A 方案：坞窗交给 SystemUI（TextureView + VirtualDisplay 才拿得到实时画面），
+                                // system_server 只在它没应答时回退到旧的自绘坞窗。
+                                if (!tryRemoteDock(floatHandleView, floatHandleInfo, cl)) {
+                                    showFloatDock(floatHandleView, floatHandleInfo, cl);
+                                }
                             } catch (Throwable t) {
                                 XposedBridge.log(TAG + " hookFloatHandleClick error: " + t.getMessage());
                             }
@@ -555,6 +592,832 @@ public class MainHook implements IXposedHookLoadPackage {
         } catch (Throwable t) {
             XposedBridge.log(TAG + " hookFloatHandleClick failed: " + t.getMessage());
         }
+    }
+
+    // ==================== A 方案：坞窗交给 SystemUI（实时画面） ====================
+
+    private static boolean sRemoteDockOpen = false;
+    private static boolean sRemoteDockAcked = false;
+    private static BroadcastReceiver sDockEventReceiver;
+    private static Handler sMainHandler;
+    private static Runnable sRemoteFallback;
+    private static ClassLoader sPendingClassLoader;
+    /**
+     * 悬浮球视图所在线程（android.ui）的 Handler，点击那一刻抓的。
+     * 不能在需要时用 {@code view.post()}：悬浮球被隐藏后视图处于未 attach 状态，
+     * post 会把任务丢进 RunQueue 等下一次 traversal——而它再也不会 traversal 了，恢复动作永远不执行。
+     */
+    private static Handler sHandleHandler;
+
+    /** 上次坞窗打开时的应用列表：任务搬到虚拟显示器后 ColorOS 会丢掉 FloatHandleInfo，用它兜底。 */
+    private static int[] sCachedTaskIds;
+    private static String[] sCachedPackages;
+    private static int[] sCachedUserIds;
+
+    /** 等任务落回主屏再最小化的后台线程。 */
+    private static final java.util.concurrent.ExecutorService MINIMIZER =
+            java.util.concurrent.Executors.newSingleThreadExecutor(
+                    r -> new Thread(r, "freewindow-minimize"));
+    private static final long MINIMIZE_WAIT_MS = 2500L;
+
+    private static Handler mainHandler() {
+        if (sMainHandler == null) sMainHandler = new Handler(Looper.getMainLooper());
+        return sMainHandler;
+    }
+
+    /** 在悬浮球自己的线程执行；拿不到线程返回 false，由调用方决定是否放弃。 */
+    private static boolean runOnHandleThread(Runnable work) {
+        if (sHandleHandler != null) {
+            sHandleHandler.post(work);
+            return true;
+        }
+        Object handle = sCurrentFloatHandleView;
+        if (handle instanceof View && ((View) handle).post(work)) {
+            return true;
+        }
+        return false;
+    }
+
+    /**
+     * 请求 SystemUI 弹出实时坞窗。成功返回 true（旧坞窗不再创建）。
+     *
+     * <p>SystemUI 若在 700ms 内没有回 "shown"（进程没起来 / 作用域没勾 / hook 失败），
+     * 自动回退到 system_server 里的旧坞窗，保证功能不会因为迁移而不可用。
+     */
+    private boolean tryRemoteDock(final Object floatHandleView, final Object floatHandleInfo,
+                                  final ClassLoader cl) {
+        if (!enableLiveDock) return false;
+        try {
+            final Context ctx = (Context) XposedHelpers.callMethod(floatHandleView, "getContext");
+            if (ctx == null) return false;
+            ensureDockEventReceiver(ctx);
+
+            int side = 1;
+            try {
+                side = XposedHelpers.getIntField(floatHandleInfo, "side");
+            } catch (Throwable ignored) {
+            }
+
+            List<Object> infos = dockInfos(cl);
+            int[] taskIds;
+            String[] packages;
+            int[] userIds;
+            if (!infos.isEmpty()) {
+                int n = infos.size();
+                taskIds = new int[n];
+                packages = new String[n];
+                userIds = new int[n];
+                for (int i = 0; i < n; i++) {
+                    Object info = infos.get(i);
+                    taskIds[i] = XposedHelpers.getIntField(info, "taskId");
+                    packages[i] = (String) XposedHelpers.callMethod(info, "getPackageName");
+                    userIds[i] = (int) XposedHelpers.callMethod(info, "getUserId");
+                }
+                // 任务被搬到虚拟显示器后 ColorOS 会丢掉 FloatHandleInfo，
+                // 所以自己记一份，下次开坞窗时列表才不会空。
+                sCachedTaskIds = taskIds.clone();
+                sCachedPackages = packages.clone();
+                sCachedUserIds = userIds.clone();
+            } else if (sCachedTaskIds != null && sCachedTaskIds.length > 0) {
+                List<Integer> alive = new ArrayList<>();
+                for (int i = 0; i < sCachedTaskIds.length; i++) {
+                    if (findTaskObject(sCachedTaskIds[i], cl) != null) alive.add(i);
+                }
+                taskIds = new int[alive.size()];
+                packages = new String[alive.size()];
+                userIds = new int[alive.size()];
+                for (int k = 0; k < alive.size(); k++) {
+                    int i = alive.get(k);
+                    taskIds[k] = sCachedTaskIds[i];
+                    packages[k] = sCachedPackages[i];
+                    userIds[k] = sCachedUserIds[i];
+                }
+                XposedBridge.log(TAG + " dock list from cache apps=" + taskIds.length);
+            } else {
+                return false;
+            }
+            if (taskIds.length == 0) return false;
+
+            sRemoteDockAcked = false;
+            sRemoteDockOpen = true;
+            sDockShowing = true;
+            sPendingClassLoader = cl;
+            hideAllFloatHandles(cl, 0f);
+
+            // UserHandle.ALL 是 @hide，直接用普通广播（system_server 以 system 身份发出）。
+            int[] displayIds = new int[taskIds.length];
+            byte[][] snapshots = new byte[taskIds.length][];
+            boolean[] dynamicFlags = new boolean[taskIds.length];
+            float[] aspects = new float[taskIds.length];
+            for (int i = 0; i < taskIds.length; i++) {
+                displayIds[i] = MirageWindowHook.mirageDisplayOf(taskIds[i]);
+                snapshots[i] = encodeSnapshot(LivelyHook.snapshotOf(taskIds[i]));
+                // 每个应用独立判定，结果按任务缓存：一张卡是动态的不会把别的卡拉黑。
+                dynamicFlags[i] = resolveDynamic(ctx, taskIds[i], packages[i], snapshots[i]);
+                aspects[i] = taskAspect(taskIds[i], cl);
+            }
+            ctx.sendBroadcast(DockProtocol.showIntent(side, taskIds, packages, userIds,
+                    displayIds, snapshots, dynamicFlags, aspects));
+            XposedBridge.log(TAG + " remote dock requested apps=" + taskIds.length + " side=" + side);
+
+            sRemoteFallback = new Runnable() {
+                @Override
+                public void run() {
+                    if (!sRemoteDockOpen || sRemoteDockAcked) return;
+                    XposedBridge.log(TAG + " SystemUI dock did not answer, fall back to local dock");
+                    sRemoteDockOpen = false;
+                    sDockShowing = false;
+                    hideAllFloatHandles(cl, 1f);
+                    // 本地坞窗也要在悬浮球线程上创建：窗口的 ViewRootImpl 会绑定创建线程，
+                    // 之后它的触摸回调 / 悬浮球动画都跟着这个线程走。
+                    Runnable create = new Runnable() {
+                        @Override
+                        public void run() {
+                            try {
+                                showFloatDock(floatHandleView, floatHandleInfo, cl);
+                            } catch (Throwable t) {
+                                XposedBridge.log(TAG + " local dock fallback failed: " + t);
+                            }
+                        }
+                    };
+                    if (runOnHandleThread(create)) return;
+                    create.run();
+                }
+            };
+            mainHandler().postDelayed(sRemoteFallback, 700L);
+            return true;
+        } catch (Throwable t) {
+            XposedBridge.log(TAG + " tryRemoteDock failed: " + t);
+            sRemoteDockOpen = false;
+            sDockShowing = false;
+            return false;
+        }
+    }
+
+
+    // ---------- 静态 / 动态判定（完全由用户在设置里指定） ----------
+
+    /** taskId → 判定结果，一次判定长期沿用，避免别的应用播放造成翻转。 */
+    private static final java.util.Map<Integer, Boolean> sDynamicCache =
+            new java.util.concurrent.ConcurrentHashMap<>();
+    /** 用户在设置里勾选的"动态应用"；非空时以它为准。 */
+    private static final java.util.Set<String> sUserDynamicPackages =
+            java.util.Collections.synchronizedSet(new java.util.HashSet<String>());
+
+    private static void updateUserDynamicPackages(String csv) {
+        java.util.Set<String> parsed = new java.util.HashSet<>();
+        if (csv != null && !csv.isEmpty()) {
+            for (String item : csv.split(",")) {
+                if (!item.isEmpty()) parsed.add(item);
+            }
+        }
+        if (!parsed.equals(sUserDynamicPackages)) {
+            sUserDynamicPackages.clear();
+            sUserDynamicPackages.addAll(parsed);
+            sDynamicCache.clear();
+            XposedBridge.log(TAG + " dynamic whitelist updated size=" + parsed.size());
+        }
+    }
+
+    /** 任务画面的宽高比（height / width），用于让卡片按应用真实比例留高度。 */
+    private static float taskAspect(int taskId, ClassLoader cl) {
+        try {
+            Object task = findTaskObject(taskId, cl);
+            if (task != null) {
+                Rect bounds = (Rect) XposedHelpers.callMethod(task, "getBounds");
+                if (bounds != null && bounds.width() > 0 && bounds.height() > 0) {
+                    float aspect = bounds.height() / (float) bounds.width();
+                    return Math.max(1f, Math.min(aspect, 3f));
+                }
+            }
+        } catch (Throwable ignored) {
+        }
+        return 16f / 9f;
+    }
+
+    private static boolean resolveDynamic(Context ctx, int taskId, String pkg, byte[] snapshot) {
+        Boolean cached = sDynamicCache.get(taskId);
+        if (cached != null) return cached;
+        // 只有用户在设置里勾选的应用走实时镜像，其余一律静态截图。
+        // 例外：截图拿不到时退回镜像，避免卡片只剩一个图标。
+        boolean dynamic = (pkg != null && sUserDynamicPackages.contains(pkg)) || snapshot == null;
+        sDynamicCache.put(taskId, dynamic);
+        XposedBridge.log(TAG + " dynamic? taskId=" + taskId + " pkg=" + pkg
+                + " dynamic=" + dynamic + " snapshot=" + (snapshot != null));
+        return dynamic;
+    }
+
+    /** 把快照压成小体积 JPEG，随广播带给 SystemUI 当静态卡片图。 */
+    private static byte[] encodeSnapshot(android.graphics.Bitmap source) {
+        if (source == null || source.isRecycled()) return null;
+        try {
+            android.graphics.Bitmap scaled = source;
+            int width = source.getWidth();
+            if (width > 280) {
+                int height = Math.max(1, Math.round(280f * source.getHeight() / width));
+                scaled = android.graphics.Bitmap.createScaledBitmap(source, 280, height, true);
+            }
+            java.io.ByteArrayOutputStream out = new java.io.ByteArrayOutputStream();
+            scaled.compress(android.graphics.Bitmap.CompressFormat.JPEG, 70, out);
+            if (scaled != source) scaled.recycle();
+            return out.toByteArray();
+        } catch (Throwable t) {
+            XposedBridge.log(TAG + " encodeSnapshot failed: " + t);
+            return null;
+        }
+    }
+
+    private static List<Object> dockInfos(ClassLoader cl) {
+        List<Object> out = new ArrayList<>();
+        try {
+            Object fhc = XposedHelpers.callStaticMethod(
+                    XposedHelpers.findClass("com.android.server.wm.FloatHandleController", cl), "getInstance");
+            Object list = XposedHelpers.getObjectField(fhc, "mFloatHandleInfoList");
+            if (list instanceof List) {
+                for (Object info : (List<?>) list) out.add(info);
+            }
+        } catch (Throwable t) {
+            XposedBridge.log(TAG + " dockInfos error: " + t.getMessage());
+        }
+        return out;
+    }
+
+    private void ensureDockEventReceiver(final Context ctx) {
+        if (sDockEventReceiver != null) return;
+        BroadcastReceiver receiver = new BroadcastReceiver() {
+            @Override
+            public void onReceive(Context context, Intent intent) {
+                handleDockEvent(context, intent);
+            }
+        };
+        IntentFilter filter = new IntentFilter(DockProtocol.ACTION_EVENT);
+        filter.addAction(DockProtocol.ACTION_MIRROR_ATTACH);
+        filter.addAction(DockProtocol.ACTION_MIRROR_DETACH);
+        try {
+            java.lang.reflect.Method method = Context.class.getMethod("registerReceiver",
+                    BroadcastReceiver.class, IntentFilter.class, int.class);
+            method.invoke(ctx, receiver, filter, 0x2 /* RECEIVER_EXPORTED */);
+        } catch (Throwable t) {
+            ctx.registerReceiver(receiver, filter);
+        }
+        // 注册成功之后才落字段：注册失败下次还能重试。
+        sDockEventReceiver = receiver;
+        XposedBridge.log(TAG + " dock event receiver registered");
+    }
+
+    private void handleDockEvent(Context ctx, Intent intent) {
+        if (intent == null) return;
+        String action = intent.getAction();
+        if (DockProtocol.ACTION_MIRROR_ATTACH.equals(action)) {
+            handleMirrorAttach(ctx, intent);
+            return;
+        }
+        if (DockProtocol.ACTION_MIRROR_DETACH.equals(action)) {
+            handleMirrorDetach(intent);
+            return;
+        }
+        String event = intent.getStringExtra(DockProtocol.EXTRA_EVENT);
+        XposedBridge.log(TAG + " dock event=" + event);
+        if (DockProtocol.EVENT_SHOWN.equals(event)) {
+            sRemoteDockAcked = true;
+            if (sRemoteFallback != null) mainHandler().removeCallbacks(sRemoteFallback);
+            return;
+        }
+        if (!DockProtocol.EVENT_CLOSED.equals(event)) return;
+
+        final int chosen = intent.getIntExtra(DockProtocol.EXTRA_CHOSEN_TASK_ID, -1);
+        final int[] moved = intent.getIntArrayExtra(DockProtocol.EXTRA_MOVED_TASK_IDS);
+        final boolean clearAll = intent.getBooleanExtra(DockProtocol.EXTRA_CLEAR_ALL, false);
+
+        if (sRemoteFallback != null) mainHandler().removeCallbacks(sRemoteFallback);
+        sRemoteDockOpen = false;
+        sRemoteDockAcked = false;
+        sDockShowing = false;
+
+        // 广播接收器跑在 system_server main 上，但恢复迷你窗 / 重新最小化都会启动 ColorOS 的悬浮球动画，
+        // 必须回到悬浮球自己的线程执行（否则 main 上 requestLayout → system_server 软重启）。
+        Runnable work = new Runnable() {
+            @Override
+            public void run() {
+                applyDockClosed(chosen, moved, clearAll);
+            }
+        };
+        if (runOnHandleThread(work)) return;
+        XposedBridge.log(TAG + " no handle thread, run dock close on main");
+        work.run();
+    }
+
+    // ==================== 镜像：把幻影显示器的画面接到卡片图层 ====================
+
+    private static final java.util.Map<Integer, android.view.SurfaceControl> sMirrors =
+            new java.util.concurrent.ConcurrentHashMap<>();
+    /** mirrorKey → 包名，用于拆镜像时把帧率交还系统。 */
+    private static final java.util.Map<Integer, String> sMirrorPackages =
+            new java.util.concurrent.ConcurrentHashMap<>();
+
+    /**
+     * SystemUI 递过来一个卡片图层的 SurfaceControl，我们把幻影显示器的内容镜像上去。
+     * 只读：不改任务归属、不动窗口、不影响 ColorOS 的球。
+     */
+    private void handleMirrorAttach(final Context ctx, final Intent intent) {
+        // 读 DisplayContent 要拿 WMS 全局锁，绝不能占着 system_server 主线程去等。
+        MINIMIZER.execute(new Runnable() {
+            @Override
+            public void run() {
+                doMirrorAttach(ctx, intent);
+            }
+        });
+    }
+
+    private void doMirrorAttach(Context ctx, Intent intent) {
+        final int key = intent.getIntExtra(DockProtocol.EXTRA_MIRROR_KEY, 0);
+        final int displayId = intent.getIntExtra(DockProtocol.EXTRA_DISPLAY_IDS, 0);
+        final int taskId = intent.getIntExtra(DockProtocol.EXTRA_TASK_ID, 0);
+        final int targetW = intent.getIntExtra(DockProtocol.EXTRA_MIRROR_WIDTH, 0);
+        final int targetH = intent.getIntExtra(DockProtocol.EXTRA_MIRROR_HEIGHT, 0);
+        android.os.Parcelable extra = intent.getParcelableExtra(DockProtocol.EXTRA_SURFACE);
+        if (!(extra instanceof android.view.SurfaceControl) || key == 0) {
+            XposedBridge.log(TAG + " mirror attach ignored displayId=" + displayId + " key=" + key);
+            return;
+        }
+        final android.view.SurfaceControl target = (android.view.SurfaceControl) extra;
+        ClassLoader cl = sPendingClassLoader != null ? sPendingClassLoader : sClassLoader;
+        try {
+            Object fhc = XposedHelpers.callStaticMethod(
+                    XposedHelpers.findClass("com.android.server.wm.FloatHandleController", cl), "getInstance");
+            Object atms = XposedHelpers.getObjectField(fhc, "mAtms");
+            Object lock = null;
+            try {
+                lock = XposedHelpers.getObjectField(atms, "mGlobalLock");
+            } catch (Throwable ignored) {
+            }
+            synchronized (lock != null ? lock : sMirrors) {
+                android.view.SurfaceControl source = null;
+                int sourceW = 0;
+                int sourceH = 0;
+                // 优先镜像任务自己的图层：幻影显示器整屏里应用只占一小块，镜像整屏会一片黑。
+                if (taskId > 0) {
+                    Object task = findTaskObject(taskId, cl);
+                    if (task != null) {
+                        Object surface = XposedHelpers.callMethod(task, "getSurfaceControl");
+                        if (surface instanceof android.view.SurfaceControl) {
+                            source = (android.view.SurfaceControl) surface;
+                        }
+                        try {
+                            Rect bounds = (Rect) XposedHelpers.callMethod(task, "getBounds");
+                            if (bounds != null) {
+                                sourceW = bounds.width();
+                                sourceH = bounds.height();
+                            }
+                        } catch (Throwable ignored) {
+                        }
+                    }
+                }
+                if (source == null && displayId > 0) {
+                    Object rwc = XposedHelpers.getObjectField(atms, "mRootWindowContainer");
+                    Object dc = XposedHelpers.callMethod(rwc, "getDisplayContent", displayId);
+                    if (dc != null) {
+                        Object surface = XposedHelpers.callMethod(dc, "getSurfaceControl");
+                        if (surface instanceof android.view.SurfaceControl) {
+                            source = (android.view.SurfaceControl) surface;
+                        }
+                        int[] size = displaySize(dc);
+                        sourceW = size[0];
+                        sourceH = size[1];
+                    }
+                    if (source == null) {
+                        XposedBridge.log(TAG + " mirror: no display surface displayId=" + displayId);
+                    }
+                }
+                if (source == null || !source.isValid()) {
+                    XposedBridge.log(TAG + " mirror: source invalid displayId=" + displayId
+                            + " taskId=" + taskId);
+                    return;
+                }
+                Method mirror = android.view.SurfaceControl.class
+                        .getDeclaredMethod("mirrorSurface", android.view.SurfaceControl.class);
+                mirror.setAccessible(true);
+                android.view.SurfaceControl copy =
+                        (android.view.SurfaceControl) mirror.invoke(null, source);
+                if (copy == null) {
+                    XposedBridge.log(TAG + " mirror: mirrorSurface returned null");
+                    return;
+                }
+                android.view.SurfaceControl.Transaction tx =
+                        new android.view.SurfaceControl.Transaction().reparent(copy, target);
+                float scale = fitScale(sourceW, sourceH, targetW, targetH);
+                final int corner = intent.getIntExtra(DockProtocol.EXTRA_CORNER, 0);
+                if (scale > 0f) {
+                    // 等比铺满卡片（fit：整屏完整显示），水平居中、顶部对齐，超出部分裁掉。
+                    // setMatrix / setWindowCrop / setCornerRadius 是 @hide，编译期拿不到，反射调用。
+                    int cropW = Math.min(sourceW, Math.round(targetW / scale));
+                    int cropH = Math.min(sourceH, Math.round(targetH / scale));
+                    int cropLeft = Math.max(0, (sourceW - cropW) / 2);
+                    Method setMatrix = android.view.SurfaceControl.Transaction.class.getMethod(
+                            "setMatrix", android.view.SurfaceControl.class,
+                            float.class, float.class, float.class, float.class);
+                    Method setWindowCrop = android.view.SurfaceControl.Transaction.class.getMethod(
+                            "setWindowCrop", android.view.SurfaceControl.class, Rect.class);
+                    setMatrix.invoke(tx, copy, scale, 0f, 0f, scale);
+                    setWindowCrop.invoke(tx, copy, new Rect(cropLeft, 0, cropLeft + cropW, cropH));
+                    tx.setPosition(copy, -cropLeft * scale, 0f);
+                } else {
+                    tx.setPosition(copy, 0f, 0f);
+                }
+                if (corner > 0) {
+                    try {
+                        Method setCorner = android.view.SurfaceControl.Transaction.class.getMethod(
+                                "setCornerRadius", android.view.SurfaceControl.class, float.class);
+                        setCorner.invoke(tx, copy, (float) corner);
+                    } catch (Throwable t) {
+                        XposedBridge.log(TAG + " setCornerRadius failed: " + t);
+                    }
+                }
+                tx.setLayer(copy, 0).apply();
+                sMirrors.put(key, copy);
+                // 官方给灵动卡片单独控帧（默认会降到低帧），这里把被镜像的应用顶到 60。
+                String mirrorPkg = intent.getStringExtra(DockProtocol.EXTRA_PACKAGE);
+                setPackageFrameRate(mirrorPkg, 60f);
+                if (mirrorPkg != null && !mirrorPkg.isEmpty()) {
+                    sMirrorPackages.put(key, mirrorPkg);
+                }
+                XposedBridge.log(TAG + " mirror attached key=" + key
+                        + " displayId=" + displayId + " taskId=" + taskId
+                        + " source=" + sourceW + "x" + sourceH
+                        + " target=" + targetW + "x" + targetH
+                        + " scale=" + scale);
+            }
+        } catch (Throwable t) {
+            XposedBridge.log(TAG + " mirror attach failed displayId=" + displayId + ": " + t);
+        }
+    }
+
+    /** cover 缩放：铺满目标区域，允许裁切。尺寸不可用时返回 0（不缩放）。 */
+    private static float fitScale(int sourceW, int sourceH, int targetW, int targetH) {
+        if (sourceW <= 0 || sourceH <= 0 || targetW <= 0 || targetH <= 0) return 0f;
+        // 卡片按应用比例留的高度，这里用 min：整屏完整显示，不会被裁掉上下。
+        return Math.min(targetW / (float) sourceW, targetH / (float) sourceH);
+    }
+
+    /** 显示器逻辑尺寸（px）。 */
+    private static int[] displaySize(Object displayContent) {
+        try {
+            Object info = XposedHelpers.callMethod(displayContent, "getDisplayInfo");
+            if (info != null) {
+                int w = 0;
+                int h = 0;
+                try {
+                    w = (int) XposedHelpers.callMethod(info, "getLogicalWidth");
+                    h = (int) XposedHelpers.callMethod(info, "getLogicalHeight");
+                } catch (Throwable ignored) {
+                }
+                if (w <= 0 || h <= 0) {
+                    w = XposedHelpers.getIntField(info, "logicalWidth");
+                    h = XposedHelpers.getIntField(info, "logicalHeight");
+                }
+                if (w > 0 && h > 0) return new int[]{w, h};
+            }
+        } catch (Throwable t) {
+            XposedBridge.log(TAG + " displaySize failed: " + t);
+        }
+        return new int[]{0, 0};
+    }
+
+    /**
+     * 给单个应用控帧（官方 LivelyViewFpsPolicy 用的同一条通路）：
+     * {@code oplus_vrr_service → IOPlusRefreshRate.setFrameRateTargetControl(fps, pkg, on, caller)}。
+     * fps = 60 顶到 60 帧，fps = 0 交还给系统自动。
+     */
+    private static void setPackageFrameRate(String pkg, float fps) {
+        if (pkg == null || pkg.isEmpty()) return;
+        try {
+            Class<?> serviceManager = Class.forName("android.os.ServiceManager");
+            Object binder = serviceManager.getMethod("getService", String.class)
+                    .invoke(null, "oplus_vrr_service");
+            if (binder == null) {
+                XposedBridge.log(TAG + " vrr service unavailable pkg=" + pkg);
+                return;
+            }
+            Class<?> stub = Class.forName("com.oplus.vrr.IOPlusRefreshRate$Stub");
+            Object service = stub.getMethod("asInterface", android.os.IBinder.class)
+                    .invoke(null, binder);
+            if (service == null) return;
+            service.getClass().getMethod("setFrameRateTargetControl",
+                            float.class, String.class, boolean.class, String.class)
+                    .invoke(service, fps, pkg, true, "freewindow");
+            XposedBridge.log(TAG + " frame rate " + fps + " pkg=" + pkg);
+        } catch (Throwable t) {
+            XposedBridge.log(TAG + " setFrameRateTargetControl failed pkg=" + pkg + ": " + t);
+        }
+    }
+
+    private void handleMirrorDetach(Intent intent) {
+        int key = intent.getIntExtra(DockProtocol.EXTRA_MIRROR_KEY, 0);
+        String pkg = sMirrorPackages.remove(key);
+        if (pkg != null && !pkg.isEmpty()) {
+            // 交还帧率控制，别让应用一直锁在 60。
+            setPackageFrameRate(pkg, 0f);
+        }
+        android.view.SurfaceControl copy = sMirrors.remove(key);
+        if (copy == null) return;
+        try {
+            new android.view.SurfaceControl.Transaction().reparent(copy, null).apply();
+            copy.release();
+            XposedBridge.log(TAG + " mirror detached key=" + key);
+        } catch (Throwable t) {
+            XposedBridge.log(TAG + " mirror detach failed key=" + key + ": " + t);
+        }
+    }
+
+    /** 坞窗收起时兜底清掉所有镜像。 */
+    private void releaseAllMirrors() {
+        for (Integer key : new ArrayList<>(sMirrorPackages.keySet())) {
+            String pkg = sMirrorPackages.remove(key);
+            if (pkg != null && !pkg.isEmpty()) setPackageFrameRate(pkg, 0f);
+        }
+        for (Integer key : new ArrayList<>(sMirrors.keySet())) {
+            android.view.SurfaceControl copy = sMirrors.remove(key);
+            if (copy == null) continue;
+            try {
+                new android.view.SurfaceControl.Transaction().reparent(copy, null).apply();
+                copy.release();
+            } catch (Throwable ignored) {
+            }
+        }
+    }
+
+    /** 只允许在悬浮球自己的线程执行。 */
+    private void applyDockClosed(int chosen, int[] moved, boolean clearAll) {
+        ClassLoader cl = sPendingClassLoader != null ? sPendingClassLoader : sClassLoader;
+        try {
+            // 坞窗收起时先把镜像拆掉。
+            releaseAllMirrors();
+            if (clearAll) {
+                clearAllDockApps(cl);
+            } else if (chosen > 0) {
+                Object info = findDockInfo(chosen, cl);
+                if (info != null) {
+                    // 用户点了某张卡：按官方逻辑把它恢复成小窗（顺带会释放幻影显示器）。
+                    restoreFloatInfo(info, cl);
+                } else {
+                    XposedBridge.log(TAG + " no float info for chosen taskId=" + chosen);
+                }
+            }
+            // 没有选中卡片时：应用继续留在幻影显示器上跑，球照旧显示，什么都不做。
+        } catch (Throwable t) {
+            XposedBridge.log(TAG + " applyDockClosed error: " + t);
+        }
+        hideAllFloatHandles(cl, 1f);
+    }
+
+    /** 等任务落回 display 0 后再走官方恢复，避免对着还在虚拟显示器上的任务操作。 */
+    private void scheduleRestore(final int taskId, final Object info, final ClassLoader cl) {
+        MINIMIZER.execute(new Runnable() {
+            @Override
+            public void run() {
+                try {
+                    long deadline = android.os.SystemClock.uptimeMillis() + MINIMIZE_WAIT_MS;
+                    while (android.os.SystemClock.uptimeMillis() < deadline) {
+                        Object task = findTaskObject(taskId, cl);
+                        if (task == null) break;
+                        int displayId = -1;
+                        try {
+                            Object value = XposedHelpers.callMethod(task, "getDisplayId");
+                            if (value instanceof Integer) displayId = (Integer) value;
+                        } catch (Throwable ignored) {
+                        }
+                        if (displayId == 0) break;
+                        android.os.SystemClock.sleep(80L);
+                    }
+                    runOnHandleThread(new Runnable() {
+                        @Override
+                        public void run() {
+                            restoreFloatInfo(info, cl);
+                        }
+                    });
+                } catch (Throwable t) {
+                    XposedBridge.log(TAG + " scheduleRestore failed taskId=" + taskId + ": " + t);
+                }
+            }
+        });
+    }
+
+    private Object findDockInfo(int taskId, ClassLoader cl) {
+        for (Object info : dockInfos(cl)) {
+            try {
+                if (XposedHelpers.getIntField(info, "taskId") == taskId) return info;
+            } catch (Throwable ignored) {
+            }
+        }
+        return null;
+    }
+
+    /**
+     * 官方恢复路径：直接回调 ColorOS 自己的"点悬浮球恢复小窗"入口
+     * {@code FloatHandleView.startFlexibleFreeformFromHandleView(info, reason)}。
+     *
+     * <p>之前改成手动调 {@code startActivityByFloatInfo} 并魔改 type/zoomState，
+     * 结果恢复成的是通用浮窗（没有小窗标题栏）。官方那条路会自己把 flexibleTaskInfo 的
+     * bounds/scale/ratio 算好，才是真正的自由小窗。
+     */
+    private void restoreFloatInfo(Object info, ClassLoader cl) {
+        sRestoring = true;
+        try {
+            Object handle = sCurrentFloatHandleView;
+            if (handle != null) {
+                try {
+                    XposedHelpers.callMethod(handle, "startFlexibleFreeformFromHandleView",
+                            info, "freewindow_restore");
+                    XposedBridge.log(TAG + " restore via official handle path taskId="
+                            + XposedHelpers.getIntField(info, "taskId"));
+                    return;
+                } catch (Throwable t) {
+                    XposedBridge.log(TAG + " official restore failed, fallback: " + t);
+                }
+            }
+            // 兜底：老的直接恢复。
+            Object fhc = XposedHelpers.callStaticMethod(
+                    XposedHelpers.findClass("com.android.server.wm.FloatHandleController", cl), "getInstance");
+            XposedHelpers.callMethod(fhc, "startActivityByFloatInfo", info, "lively_panel");
+            XposedBridge.log(TAG + " restoreFloatInfo(fallback) done taskId="
+                    + XposedHelpers.getIntField(info, "taskId"));
+        } catch (Throwable t) {
+            XposedBridge.log(TAG + " restoreFloatInfo failed: " + t);
+        } finally {
+            // 恢复期间别再拦一次悬浮球点击（否则会又弹一次坞窗）。
+            if (sHandleHandler != null) {
+                sHandleHandler.postDelayed(new Runnable() {
+                    @Override
+                    public void run() {
+                        sRestoring = false;
+                    }
+                }, 1200L);
+            } else {
+                sRestoring = false;
+            }
+        }
+    }
+
+    /**
+     * 后台等任务落回 display 0，再立刻把它最小化回悬浮球。
+     *
+     * <p>顺序很重要：坞窗一关，SystemUI 才把任务搬回主屏；如果这时直接 startMinimize，
+     * 任务还在虚拟显示器上，最小化不会生效，用户看到的就是"应用全屏回来了"。
+     * 所以这里在后台线程轮询 displayId，落地后马上 post 回悬浮球线程执行最小化。
+     */
+    private void scheduleMinimize(final int taskId, final ClassLoader cl) {
+        MINIMIZER.execute(new Runnable() {
+            @Override
+            public void run() {
+                try {
+                    long deadline = android.os.SystemClock.uptimeMillis() + MINIMIZE_WAIT_MS;
+                    while (android.os.SystemClock.uptimeMillis() < deadline) {
+                        Object task = findTaskObject(taskId, cl);
+                        if (task == null) {
+                            XposedBridge.log(TAG + " scheduleMinimize: task gone taskId=" + taskId);
+                            return;
+                        }
+                        int displayId = -1;
+                        try {
+                            Object value = XposedHelpers.callMethod(task, "getDisplayId");
+                            if (value instanceof Integer) displayId = (Integer) value;
+                        } catch (Throwable ignored) {
+                        }
+                        if (displayId == 0) {
+                            final int readyTask = taskId;
+                            if (!runOnHandleThread(new Runnable() {
+                                @Override
+                                public void run() {
+                                    // 关键一步：任务从虚拟显示器搬回来时已经变成"全屏窗口"，
+                                    // 这时直接 startMinimize 不会生效（它只认自由小窗状态）。
+                                    // 先按官方逻辑把它还原成迷你小窗，再让它缩回悬浮球。
+                                    Object info = findDockInfo(taskId, cl);
+                                    boolean restored = false;
+                                    if (info != null) {
+                                        restored = restoreFloatInfoQuiet(info, cl);
+                                    }
+                                    if (restored && sHandleHandler != null) {
+                                        sHandleHandler.postDelayed(new Runnable() {
+                                            @Override
+                                            public void run() {
+                                                doMinimize(readyTask, cl);
+                                            }
+                                        }, 220L);
+                                    } else {
+                                        doMinimize(readyTask, cl);
+                                    }
+                                }
+                            })) {
+                                XposedBridge.log(TAG + " scheduleMinimize: no handle thread taskId=" + taskId);
+                            }
+                            return;
+                        }
+                        android.os.SystemClock.sleep(80L);
+                    }
+                    XposedBridge.log(TAG + " scheduleMinimize: timeout waiting display 0 taskId=" + taskId);
+                } catch (Throwable t) {
+                    XposedBridge.log(TAG + " scheduleMinimize failed taskId=" + taskId + ": " + t);
+                }
+            }
+        });
+    }
+
+    private static Object findTaskObject(int taskId, ClassLoader cl) {
+        try {
+            Object fhc = XposedHelpers.callStaticMethod(
+                    XposedHelpers.findClass("com.android.server.wm.FloatHandleController", cl), "getInstance");
+            Object atms = XposedHelpers.getObjectField(fhc, "mAtms");
+            Object rwc = XposedHelpers.getObjectField(atms, "mRootWindowContainer");
+            return XposedHelpers.callMethod(rwc, "anyTaskForId", taskId);
+        } catch (Throwable t) {
+            return null;
+        }
+    }
+
+    /**
+     * 静默版：把任务先还原成 ColorOS 的迷你小窗状态（不打印 done 日志，失败只记一行）。
+     * 返回是否成功调用到官方恢复接口。
+     */
+    private boolean restoreFloatInfoQuiet(Object info, ClassLoader cl) {
+        try {
+            try {
+                XposedHelpers.callMethod(info, "setFlexibleTaskState", 2);
+            } catch (Throwable ignored) {
+            }
+            try {
+                int type = XposedHelpers.getIntField(info, "type");
+                if (type == 0) XposedHelpers.setIntField(info, "type", 3);
+            } catch (Throwable ignored) {
+            }
+            Object fhc = XposedHelpers.callStaticMethod(
+                    XposedHelpers.findClass("com.android.server.wm.FloatHandleController", cl), "getInstance");
+            XposedHelpers.callMethod(fhc, "startActivityByFloatInfo", info, "lively_panel");
+            XposedBridge.log(TAG + " pre-minimize restore taskId="
+                    + XposedHelpers.getIntField(info, "taskId"));
+            return true;
+        } catch (Throwable t) {
+            XposedBridge.log(TAG + " pre-minimize restore failed: " + t);
+            return false;
+        }
+    }
+
+    /**
+     * 把已经搬回 display 0 的任务重新最小化回悬浮球（必须在悬浮球线程执行）。
+     * 链路对齐 ColorOS 自身：FlexibleWindowManagerService → FlexibleTaskController
+     * → getFlexibleInfoManager(task).getZoomTaskInfo() → OplusFlexibleDCSManager.startMinimize(info, task, "8")
+     */
+    private void doMinimize(int taskId, ClassLoader cl) {
+        try {
+            Object task = findTaskObject(taskId, cl);
+            if (task == null) {
+                XposedBridge.log(TAG + " reMinimize: task not found taskId=" + taskId);
+                return;
+            }
+            // 先把任务压回后台：任务离开 display 0 后 ColorOS 会丢掉它的 FloatHandleInfo，
+            // startMinimize 已经没有作用对象，不压后台就会以全屏窗口停在桌面上。
+            try {
+                XposedHelpers.callMethod(task, "moveToBack", "freewindow", null);
+                XposedBridge.log(TAG + " sent task to back taskId=" + taskId);
+            } catch (Throwable t) {
+                XposedBridge.log(TAG + " moveToBack failed taskId=" + taskId + ": " + t);
+            }
+            Object fwms = XposedHelpers.callStaticMethod(
+                    XposedHelpers.findClass("com.android.server.wm.FlexibleWindowManagerService", cl),
+                    "getInstance", new Object[]{null});
+            Object ftc = XposedHelpers.callMethod(fwms, "getFlexibleTaskController");
+            Object infoMgr = callOneArg(ftc, "getFlexibleInfoManager", task);
+            if (infoMgr == null) {
+                XposedBridge.log(TAG + " reMinimize: no flexible info manager taskId=" + taskId);
+                return;
+            }
+            Object zoomInfo = XposedHelpers.callMethod(infoMgr, "getZoomTaskInfo");
+            Object dcs = XposedHelpers.callMethod(ftc, "getmOplusFlexibleDCSManager");
+            XposedHelpers.callMethod(dcs, "startMinimize", zoomInfo, task, "8");
+            XposedBridge.log(TAG + " re-minimized taskId=" + taskId);
+        } catch (Throwable t) {
+            XposedBridge.log(TAG + " reMinimize failed taskId=" + taskId + ": " + t);
+        }
+    }
+
+    /** 按名字找单参方法（参数类型按实参推断），用于跨 ROM 的方法签名差异。 */
+    private static Object callOneArg(Object target, String name, Object argument) {
+        if (target == null) return null;
+        Class<?> type = target.getClass();
+        while (type != null && type != Object.class) {
+            for (Method method : type.getDeclaredMethods()) {
+                if (!name.equals(method.getName()) || method.getParameterCount() != 1) continue;
+                Class<?> parameter = method.getParameterTypes()[0];
+                if (!parameter.isInstance(argument)) continue;
+                try {
+                    method.setAccessible(true);
+                    return method.invoke(target, argument);
+                } catch (Throwable t) {
+                    XposedBridge.log(TAG + " callOneArg " + name + " failed: " + t);
+                }
+            }
+            type = type.getSuperclass();
+        }
+        return null;
     }
 
     /** 显示坞窗：从悬浮球所在侧滑出，展示所有悬浮球应用卡片。 */
@@ -994,7 +1857,8 @@ public class MainHook implements IXposedHookLoadPackage {
 
     /** 清除坞窗中所有应用。 */
     private void clearAllDockApps(ClassLoader cl) {
-        for (Object info : new ArrayList<>(sDockApps)) {
+        // 不依赖 sDockApps：实时坞窗由 SystemUI 侧展示，system_server 这边只按官方数据源取列表。
+        for (Object info : dockInfos(cl)) {
             try {
                 String pkgName = (String) XposedHelpers.callMethod(info, "getPackageName");
                 int userId = (int) XposedHelpers.callMethod(info, "getUserId");
@@ -1063,8 +1927,37 @@ public class MainHook implements IXposedHookLoadPackage {
         }
     }
 
-    /** 悬浮球走官方 hide/show 动画；显隐只用 alpha，避免 setVisibility 把圆角打成直角。 */
-    private void hideAllFloatHandles(ClassLoader cl, float alpha) {
+    /**
+     * 悬浮球显隐。
+     *
+     * <p><b>必须钉回悬浮球自己的线程</b>：ColorOS 的 {@code hideFloatHandleView()} /
+     * {@code showFloatHandleView()} 内部就是 {@code startSwitchModeAnimation(...)}，
+     * 弹簧动画绑定的是<b>调用线程</b>的 Choreographer；而悬浮球视图树是在 {@code android.ui} 线程创建的。
+     * 一旦从 system_server main 调用（例如广播接收器回调），动画帧会在 main 上 requestLayout，
+     * 触发 ViewRootImpl 的线程校验，直接崩掉 system_server（软重启）。
+     *
+     * <p>所以这里只把任务 post 给 handle 自己；post 不进去（未 attach）就放弃动画——
+     * 宁可不隐藏悬浮球，也不能崩系统。
+     */
+    private void hideAllFloatHandles(final ClassLoader cl, final float alpha) {
+        final Object handle = sCurrentFloatHandleView;
+        if (!(handle instanceof View)) {
+            XposedBridge.log(TAG + " no float handle view, skip show/hide alpha=" + alpha);
+            return;
+        }
+        Runnable work = new Runnable() {
+            @Override
+            public void run() {
+                applyHandleVisibility(cl, alpha);
+            }
+        };
+        if (!runOnHandleThread(work)) {
+            XposedBridge.log(TAG + " no handle thread, skip show/hide alpha=" + alpha);
+        }
+    }
+
+    /** 只允许在悬浮球自己的线程执行。 */
+    private void applyHandleVisibility(ClassLoader cl, float alpha) {
         boolean hide = alpha == 0f;
         applyHandleAlpha(sCurrentFloatHandleView, hide);
         Object fhc = null;
@@ -1074,6 +1967,7 @@ public class MainHook implements IXposedHookLoadPackage {
             Object floatManager = XposedHelpers.getObjectField(fhc, "mFloatManager");
             if (floatManager != null) {
                 if (hide) {
+                    // manager 内部已经带 startSwitchModeAnimation(current, 1)，不要再自己调一次。
                     XposedHelpers.callMethod(floatManager, "hideFloatHandleView");
                     XposedBridge.log(TAG + " hideAllFloatHandles: hideFloatHandleView");
                 } else {
@@ -1085,7 +1979,6 @@ public class MainHook implements IXposedHookLoadPackage {
         } catch (Throwable t) {
             XposedBridge.log(TAG + " hideAllFloatHandles error: " + t.getMessage());
         }
-        switchHandleMode(sCurrentFloatHandleView, hide ? 1 : 4);
         if (!hide) {
             final Object controller = fhc;
             restoreHandleCorners(sCurrentFloatHandleView, controller);
@@ -1153,42 +2046,6 @@ public class MainHook implements IXposedHookLoadPackage {
         if (v == null) return;
         v.setClipToOutline(true);
         v.invalidateOutline();
-    }
-
-    private void switchHandleMode(Object handle, int toMode) {
-        if (handle == null) return;
-        try {
-            XposedHelpers.callMethod(handle, "setForceHidden", toMode == 1);
-        } catch (Throwable ignored) {
-        }
-        int fromMode = 4;
-        try {
-            fromMode = XposedHelpers.getIntField(handle, "mCurrentMode");
-        } catch (Throwable ignored) {
-        }
-        Class<?> c = handle.getClass();
-        while (c != null && c != Object.class) {
-            for (Method m : c.getDeclaredMethods()) {
-                if (!"startSwitchModeAnimation".equals(m.getName())) continue;
-                Class<?>[] types = m.getParameterTypes();
-                if (types.length < 2 || types[0] != int.class || types[1] != int.class) continue;
-                try {
-                    m.setAccessible(true);
-                    if (types.length == 2) {
-                        m.invoke(handle, fromMode, toMode);
-                    } else {
-                        Object[] args = new Object[types.length];
-                        args[0] = fromMode;
-                        args[1] = toMode;
-                        m.invoke(handle, args);
-                    }
-                    return;
-                } catch (Throwable t) {
-                    XposedBridge.log(TAG + " startSwitchModeAnimation " + t.getMessage());
-                }
-            }
-            c = c.getSuperclass();
-        }
     }
 
     /** dp 转 px。 */

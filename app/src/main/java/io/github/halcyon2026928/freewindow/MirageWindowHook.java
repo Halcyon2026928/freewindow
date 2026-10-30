@@ -35,11 +35,21 @@ public class MirageWindowHook {
     private static final String CAR_DUMMY = "android.intent.action.OPLUS_MIRAGE_CAR_DUMMY";
     /** 幻影 startActivity 触发 removeFloatHandle 的短时保护，对齐官方恢复后可拆球。 */
     private static final long KEEP_FLOAT_MS = 2800L;
+    /** 同一次最小化里 ColorOS 会多次调 startMinimize（operation 1/4/8…），这段时间内只处理第一次。 */
+    private static final long MINIMIZE_DEDUPE_MS = 3000L;
     private static final AtomicInteger sHangUpTaskId = new AtomicInteger(-1);
     private static volatile long sKeepFloatUntil = 0L;
     private static final Handler sMain = new Handler(Looper.getMainLooper());
 
+    /** taskId → 幻影显示器 id。每个任务只允许存在一个，恢复/移除时按 id 释放。 */
+    private static final java.util.concurrent.ConcurrentHashMap<Integer, Integer> sMirageDisplays =
+            new java.util.concurrent.ConcurrentHashMap<>();
+    private static final java.util.concurrent.ConcurrentHashMap<Integer, Long> sMinimizeAt =
+            new java.util.concurrent.ConcurrentHashMap<>();
+    private static ClassLoader sClassLoader;
+
     public static void hook(ClassLoader cl) {
+        sClassLoader = cl;
         XposedBridge.log(TAG + " === Game HangUp (LuckyTool C17 path) start ===");
         hookStartMinimize(cl);
         hookMoveTaskToBack(cl);
@@ -49,13 +59,43 @@ public class MirageWindowHook {
         XposedBridge.log(TAG + " === Game HangUp done ===");
     }
 
-    /** 外部（坞窗恢复）也可主动清挂机态，让官方 removeFloatHandle 生效。 */
+    /** 外部（坞窗恢复）也可主动清挂机态，让官方 removeFloatHandle 生效，并释放幻影显示器。 */
     public static void clearHangUp(int taskId) {
         int cur = sHangUpTaskId.get();
         if (taskId < 0 || cur == taskId || taskId == Integer.MIN_VALUE) {
             sHangUpTaskId.set(-1);
             sKeepFloatUntil = 0L;
             XposedBridge.log(TAG + " hangUp cleared taskId=" + taskId);
+        }
+        if (taskId > 0) releaseMirage(taskId);
+    }
+
+    /**
+     * 按 displayId 释放幻影显示器（官方 OplusMirageDisplayManagerService.releaseVirtualDisplayDevice）。
+     * 不释放的话每次最小化都会新建一个 display，任务被反复拉起、显示器一直泄漏。
+     */
+
+    /** 这个任务当前在哪个幻影显示器上跑；0 表示没有（没在后台运行）。 */
+    public static int mirageDisplayOf(int taskId) {
+        Integer displayId = sMirageDisplays.get(taskId);
+        return displayId == null ? 0 : displayId;
+    }
+
+    private static void releaseMirage(int taskId) {
+        Integer displayId = sMirageDisplays.remove(taskId);
+        if (displayId == null || displayId <= 0) return;
+        ClassLoader cl = sClassLoader;
+        if (cl == null) return;
+        try {
+            Object service = XposedHelpers.callStaticMethod(
+                    XposedHelpers.findClass(
+                            "com.android.server.display.OplusMirageDisplayManagerService", cl), "getInstance");
+            if (service != null) {
+                XposedHelpers.callMethod(service, "releaseVirtualDisplayDevice", displayId.intValue());
+                XposedBridge.log(TAG + " released mirage displayId=" + displayId + " taskId=" + taskId);
+            }
+        } catch (Throwable t) {
+            XposedBridge.log(TAG + " releaseMirage failed displayId=" + displayId + ": " + t);
         }
     }
 
@@ -80,6 +120,21 @@ public class MirageWindowHook {
                             XposedBridge.log(TAG + " startMinimize: baseIntent null");
                             return;
                         }
+                        // 去重：同一任务已有幻影显示器就直接复用，不能再开一个（否则显示器和应用实例都会泄漏）。
+                        Integer existing = sMirageDisplays.get(taskId);
+                        if (existing != null && existing > 0) {
+                            XposedBridge.log(TAG + " startMinimize: already running displayId=" + existing
+                                    + " taskId=" + taskId);
+                            return;
+                        }
+                        long now = SystemClock.uptimeMillis();
+                        Long last = sMinimizeAt.get(taskId);
+                        if (last != null && now - last < MINIMIZE_DEDUPE_MS) {
+                            XposedBridge.log(TAG + " startMinimize: duplicate call ignored taskId=" + taskId);
+                            return;
+                        }
+                        sMinimizeAt.put(taskId, now);
+
                         if (userId >= 0) {
                             baseIntent.putExtra("TASKINFO_UID", userId);
                         }
@@ -87,6 +142,9 @@ public class MirageWindowHook {
                         armKeepFloatWindow();
                         setTaskLively(task, true);
                         int displayId = startMirageWindow(cl, baseIntent);
+                        if (displayId > 0) {
+                            sMirageDisplays.put(taskId, displayId);
+                        }
                         XposedBridge.log(TAG + " HangUp startMirageWindowMode taskId=" + taskId
                                 + " userId=" + userId + " pkg=" + pkgOf(baseIntent)
                                 + " displayId=" + displayId);
@@ -179,6 +237,14 @@ public class MirageWindowHook {
                     if (tid >= 0 && tid == sHangUpTaskId.get()) {
                         clearHangUp(tid);
                     }
+                }
+            });
+            // 应用被真正移除（关掉/清后台）时也要释放幻影显示器。
+            XposedBridge.hookAllMethods(fhc, "removeFloatHandleInner", new XC_MethodHook() {
+                @Override
+                protected void afterHookedMethod(MethodHookParam param) {
+                    int tid = taskIdFromFloatArgs(param.args);
+                    if (tid > 0) releaseMirage(tid);
                 }
             });
             XposedBridge.log(TAG + " hooked clear hangUp on restore");

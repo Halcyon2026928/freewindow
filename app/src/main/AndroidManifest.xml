@@ -1,6 +1,16 @@
 <?xml version="1.0" encoding="utf-8"?>
 <manifest xmlns:android="http://schemas.android.com/apk/res/android">
 
+    <!-- Android 11+（含 Android 17）包可见性：应用列表页要能看到全部可启动应用。 -->
+    <uses-permission android:name="android.permission.QUERY_ALL_PACKAGES" />
+
+    <queries>
+        <intent>
+            <action android:name="android.intent.action.MAIN" />
+            <category android:name="android.intent.category.LAUNCHER" />
+        </intent>
+    </queries>
+
     <application
         android:allowBackup="false"
         android:icon="@mipmap/ic_launcher"
@@ -18,6 +28,12 @@
             </intent-filter>
         </activity>
 
+        <activity
+            android:name=".DynamicAppsActivity"
+            android:exported="false"
+            android:label="@string/dynamic_apps_title"
+            android:theme="@style/LightTheme" />
+
         <provider
             android:name=".ConfigProvider"
             android:authorities="io.github.halcyon2026928.freewindow.config"
@@ -29,7 +45,7 @@
 
         <meta-data
             android:name="xposeddescription"
-            android:value="隐藏自由小窗底部白条 / 顶部三点菜单栏，可独立开关，重启设备即可生效" />
+            android:value="隐藏自由小窗底部白条 / 顶部三点菜单栏，可独立开关；坞窗卡片支持实时画面" />
 
         <meta-data
             android:name="xposedminversion"
@@ -41,7 +57,7 @@
 
         <meta-data
             android:name="xposedscope"
-            android:value="android" />
+            android:value="android,com.android.systemui,com.coloros.smartsidebar" />
 
     </application>
 

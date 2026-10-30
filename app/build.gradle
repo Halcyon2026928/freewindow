@@ -13,8 +13,8 @@ android {
         //（enforceRestrictedSystemSettingsMutationForCallingPackage 抛 SecurityException），
         // 降到 32 仅警告、放行写入；模块为 Xposed 用途，不受 targetSdk 影响。
         targetSdk 32
-        versionCode 21
-        versionName "3.0.1"
+        versionCode 23
+        versionName "3.2"
     }
 
     buildTypes {

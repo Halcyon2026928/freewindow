@@ -1,6 +1,6 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
-    <color name="ic_launcher_background">#EAEAE8</color>
+    <color name="ic_launcher_background">#FAFAF8</color>
 
     <!-- 潮流深色主题配色 -->
     <color name="bg_start">#0B1020</color>

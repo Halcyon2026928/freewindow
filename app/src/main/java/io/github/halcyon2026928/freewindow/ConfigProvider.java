@@ -31,6 +31,10 @@ public class ConfigProvider extends ContentProvider {
                 prefs.getBoolean(SettingsActivity.KEY_HIDE_THREE_DOT, true) ? 1 : 0});
         c.addRow(new Object[]{SettingsActivity.KEY_ENABLE_DOCK,
                 prefs.getBoolean(SettingsActivity.KEY_ENABLE_DOCK, true) ? 1 : 0});
+        c.addRow(new Object[]{SettingsActivity.KEY_ENABLE_LIVE,
+                prefs.getBoolean(SettingsActivity.KEY_ENABLE_LIVE, true) ? 1 : 0});
+        c.addRow(new Object[]{SettingsActivity.KEY_ENABLE_HANGUP,
+                prefs.getBoolean(SettingsActivity.KEY_ENABLE_HANGUP, true) ? 1 : 0});
         return c;
     }
 
