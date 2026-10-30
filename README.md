@@ -18,7 +18,7 @@ LSPosed 模块：给 ColorOS / realme UI 的自由小窗加上一个带**实时�
 
 ### 后台保活
 
-应用收进悬浮球后仍在后台继续运行（走 ColorOS 的幻影窗口），声音和画面都不中断。可在设置里关闭。
+应用收进悬浮球后仍在后台继续运行，锁屏声音和画面都不中断。可在设置里关闭。
 
 ### 隐藏装饰
 
@@ -63,9 +63,6 @@ LSPosed 模块：给 ColorOS / realme UI 的自由小窗加上一个带**实时�
 ## 致谢
 
 本项目的实现参考了以下项目的思路与公开资料，在此一并感谢：
-
-- **ColorOS / realme UI 系统代码**：坞窗、幻影窗口、侧边栏相关接口均以系统自身实现为依据（反编译研究，不随本项目分发）；
-- **[FlymeFreeform（Flyme 小窗）](https://github.com/mangi/flymefreeform)**（GPL-3.0）：悬浮球显隐、后台保活开关的对齐参考；
 - **[LuckyTool](https://github.com/luckyzyx/LuckyTool)**（GPL-3.0）：ColorOS 17 幻影窗口 / 后台挂机路径的参考；
 - **[NeXtep 格窗工作台](https://github.com/yishisanren/NeXtep)**（Apache-2.0，fork 自 [lujinxin/NeXtep](https://github.com/lujinxin/NeXtep)）：虚拟显示器与实时预览方案的参考；
 - **[libxposed API](https://github.com/libxposed/api)**：Xposed 框架接口。
